@@ -1,0 +1,689 @@
+---
+title: "Estimating electricity impact profiles for building characteristics using smart meter data and mixed models"
+author: "Cameron Roach^[Corresponding author. E-mail address: cameron.roach@monash.edu (C. Roach).]"
+fontsize: 11pt
+papersize: a4
+bibliography: ["library.bib", "packages.bib"]
+biblio-style: authoryear-comp
+subparagraph: true
+toc: false
+header-includes:
+  - \usepackage[left]{lineno}
+  - \linenumbers
+output:
+  bookdown::pdf_document2:
+  # MonashEBSTemplates::workingpaper:
+    fig_caption: yes
+    fig_height: 5
+    fig_width: 8
+    keep_tex: yes
+    number_sections: yes
+    citation_package: biblatex
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.align = "center",
+	message = FALSE,
+	warning = FALSE,
+	dev = "pdf",
+	fig.height = 5*1.4,
+	fig.width = 8*1.4
+)
+
+rm(list=ls())
+
+set.seed(1)
+
+library(tidyverse)
+library(lubridate)
+library(MuMIn)
+library(lme4)
+library(furrr)
+library(bahelpers)
+library(myhelpr)
+source("R/load-data-2.R")
+source("R/nest-helpers.R")
+source("R/plot-helpers.R")
+
+knitr::write_bib(c("base", "MuMIn", "lme4", "cAIC4"),
+                 "packages.bib",
+                 width = 60)
+
+
+#### Inputs ===================================================================
+load_cached_models <- TRUE
+model_file <- "cache/n_df.RData"
+sim_file <- "cache/n_sim_df.RData"
+outlier_filter_range <- c(0.01, 0.99)
+seasons <- c("Summer", "Autumn", "Winter", "Spring")
+hours <- 0:23
+attribute_names <- c("TenantFeed", "WaterCooledCondenser", "DXSystem",
+                     "GasFiredBoiler", "ElectricElementHeating",
+                     "CentralDist")
+min_dt <- dmy('1/3/2015')
+max_dt <- dmy('1/3/2018')
+p_hours <- c(7, 11, 15, 19)
+
+
+#### Load data ================================================================
+all_data <- load_all_data()
+all_data$TenantFeed <- !all_data$BaseBldngFeedOnly
+n_buildings <- length(unique(all_data$b_uid))
+
+
+#### Fit/load models ==========================================================
+if (load_cached_models & file.exists(model_file)) {
+  cat("Loading cached models...\n")
+  # Load cached model
+  load(model_file)
+} else {
+  cat("Fitting models...\n")
+  
+  plan(multicore, workers = 8) # furrr multicore
+  
+  n_df <- all_data %>% 
+    filter(ts >= min_dt,
+           ts < max_dt,
+           Season %in% seasons,
+           Hour %in% hours) %>% 
+    select(Season, Hour, BID, Wh, attribute_names, ts) %>% 
+    mutate(Year = year(ts),
+           Year = if_else(month(ts) == 12, Year + 1, Year),  # FYE for summer
+           Year = Year - min(Year)) %>% # Scale so lmer doesn't fail
+    na.omit() %>% 
+    group_by(Season, Hour, BID) %>%
+    nest(.key = "Data") %>% 
+    mutate(Data = map(Data, filter_outliers, probs = outlier_filter_range)) %>% 
+    unnest() %>% 
+    group_by(Season, Hour) %>% 
+    nest(.key = "Data")
+  
+  options(na.action = "na.fail")
+  
+  n_df <- n_df %>%
+    mutate(Dredge = future_map(Data, possibly(n_dredge, NULL), termlabels = c(attribute_names, "(Year|BID)")),
+           MMAvg = map(Dredge, possibly(n_mmavg, NULL), level = 0.95),
+           Summary = map(MMAvg, possibly(summary, NULL)),
+           Coefficients = map(MMAvg, possibly(n_coef, NULL), full = TRUE, level = c(0.8, 0.9)),
+           R2 = map(Dredge, ~ attr(.x, "best_model_r2")))
+  
+  options(na.action = "na.omit")
+  
+  save(n_df, file = model_file)
+}
+
+
+#### Get plot dataframes ======================================================
+list2env(get_plot_df(n_df), envir = .GlobalEnv)
+
+
+#### Run/load simulation ======================================================
+n_sim_period <- 96  # number of hours
+sim_horizon <- n_sim_period*90  # time series horizon
+n_sim_bldng <- 150  # number of buildings
+sd_a <- 0.3
+sd_e <- 0.05
+ar_1 <- ma_1 <- 0.6
+
+# probabilities that attributes are present
+p_df <- n_df$Data[[1]] %>% 
+  select(BID, TenantFeed:CentralDist) %>% 
+  distinct() %>% 
+  summarise_if(is.logical, mean) %>% 
+  gather(Variable, p) %>% 
+  bind_rows(tibble(Variable = "Base", p = 1))
+
+sim_params <- plot_df %>% 
+  filter(Season == "Winter") %>% 
+  select(Variable, Hour, A = Estimate) %>% 
+  mutate(Variable = if_else(Variable == "(Intercept)", "Base", Variable)) %>% 
+  inner_join(p_df,
+             by= "Variable") %>% 
+  inner_join(tibble(Hour = rep(0:23, each = n_sim_period/24),
+                    Period = 1:n_sim_period),
+             by = "Hour") %>% 
+  mutate(Variable = factor(Variable, levels = c("Base", attribute_names)))
+
+if (file.exists(sim_file)) {
+  cat("Loading cached simulation...\n")
+  load(sim_file)
+} else {
+  cat("Running simulation...\n")
+  set.seed(2)  # also have seed here if I need to run simulation separately
+  plan(multicore, workers = 8) # furrr multicore
+  source("R/run-simulation.R")
+  save(sim_df, n_sim_df, file = sim_file)
+}
+```
+
+
+<!-- \begin{keywords} -->
+<!--   Smart meters, energy consumption, mixed effects models, multimodel inference, office spaces -->
+<!-- \end{keywords} -->
+
+\begin{abstract}
+Understanding the impact of building characteristics on electricity demand is important for policy and management decision making. Certain building characteristics and equipment may increase or decrease electricity consumption. Due to different operating practices, these impacts on electricity consumption may vary both across the day and across seasons. Quantifying the magnitude and statistical significance of these impacts will help managers and policy makers make better informed decisions. Here we present a mixed effects model to assess the importance of several variables on building electricity consumption. We use smart meter and building attribute data for `r n_buildings` commercial office buildings. Our building attribute data includes information on installed equipment and meter characteristics of each building. To account for uncertainty in both variable significance and model selection we follow a multimodel inference approach. Demand impact profiles that show the expected change in electricity demand when a characteristic is absent or present are produced for each season. A discussion of the commercial office building characteristics we use and their impact on the daily profile of electricity demand is presented. Our approach has the advantage of only requiring building level demand and characteristic data. No equipment level sub-metering is required. Furthermore, our approach can also be used to quantify changes in electricity consumption caused by other factors that do not directly draw electricity from the grid, such as management decisions or occupant behaviour. We conclude with a discussion of applications for our methodology and future research directions.
+\end{abstract}
+
+
+# Introduction
+
+There is an increasing need to focus on the composition of electricity demand. Whereas in the past aggregated demand was sufficient for decision making, we are now often required to delve deeper and understand what underlying factors influence demand. Doing so can give a clearer picture of which building characteristics, occupant behaviours and policies are best able to reduce electricity consumption. For example, at a state or country level we may be interested in measuring the impact of solar or battery power on a typical power demand profile. At a building level facility managers may be interested in which equipment or building characteristics improve energy efficiency and at what points of the day they typically draw demand. Policies with the greatest efficacy can be identified and further promoted. Equipment and building management practices that are most efficient can help guide management and retrofitting decisions.
+
+In this paper we focus on estimating the impact of several building characteristics on daily electricity demand. Electricity demand behaviour is typically presented in the form of power demand profiles which show the expected demand across a day. We define _demand impact profiles_ as the observed change in power demand profiles when a particular characteristic is or isn't present. Demand impact profiles show how a characteristic increases or decreases demand over an entire day. Separate profiles are produced for each season due to the strong seasonality of some characteristics (e.g. heating and cooling equipment). Our models are trained on smart meter data from commercial office buildings across Australia and building characteristic data which describes which characteristics are present for each building. As we only require time series data and metadata on individual buildings our methodology can be repeated for any scenario where similar data is available. All code and a walk-through have been made available online to allow for easy implementation (see Section \@ref(fitting-models)).
+
+Several approaches to disaggregating smart meter data and quantifying the consumption of appliances exist. Most of these approaches differ to ours. They attempt to reconstruct time series for the integrants making up total metered demand whereas we attempt to understand the average impact across the day during a particular season. @Dinesh2016-cf use Karhunen Loeve expansion to decompose low frequency smart meter measurements into the appliance level electricity demand. @Kalluri2016-ri examine time series subsequences to study appliance loads. @Reinhardt2012-aq and @Weiss2012-bs use several classification approaches that focus on identifying different appliances at a residential level. Disaggregation of household smart meter data to air-conditioning loads is explored by @Perez2014-qt and validated on 19 buildings. Load disaggregation using supervised classification techniques are explored in @Chahine2011-kq and @Liao2014-ux. @Guo2015-yo propose an algorithm for modelling appliance level consumption when only aggregated data is present and validate on a synthetic dataset. A load disaggregation approach for commercial buildings is proposed by @Norford1996-qk.
+
+A drawback of these approaches is they can only assess the impact of equipment that draw electricity directly from the grid. They cannot assess other factors such as solar energy generation or the impact of building facade properties such as glazing. Behavioural factors can not be quantified either. Furthermore, uncertainty can not be assessed whereas we construct confidence intervals for our coefficient estimates.
+
+A key advantage of other approaches is that some can create demand time series for certain loads, but we do not focus on achieving the same goal with our method. Our goal is to produce power demand profiles for characteristics and equipment of interest. We feel this is a reasonable aim. A decision maker is not interested in individual time series from a large number of buildings. Rather, they require a summary that clearly communicates how a characteristic of interest influences demand. Sub-metering may play a role in automating systems and diagnosing problems with individual pieces of equipment, but a statistical approach allows us to circumnavigate the time and costs associated with sub-metering to arrive at the same destination - a summary of how electricity usage is typically affected. In fact, the statistical approach goes further by allowing us to assign a degree of uncertainty to our findings. We can obtain an estimate for the expected change in electricity demand and a measure of confidence with which we can accept or reject our findings. In cases where inference is to be conducted we propose our multimodel inference approach using mixed models over traditional frequency analysis approaches.
+
+Some papers have focused on calculating power demand profiles for building equipment. @Gunay2016-ul and @Mahdavi2016-hm used a data driven approach to calculate power demand profiles for office equipment. Plug loads were recorded for several pieces of office equipment and a predictive model was then trained off this metered data. A similar approach was used by @Christiansen2015-nb to assess the energy consumption of medical equipment in hospitals. @Menezes2014-ng offered two approaches to creating power demand profiles. The first relies on sampling from a database of monitored loads for equipment of interest. While it does allow for the calculation of confidence intervals, a drawback is its dependence on the quality of the metered data for each piece of equipment. Another matter is that it can only assess plug loads that have previously been recorded in a database. A second approach that did not rely on a database of metered data was also proposed, but was dependent on knowing or assuming the operational schedules of small office equipment which can sometimes be difficult. Our methodology has a similar aim to these studies, but can produce estimated power demand profiles without relying on a database of metered data for equipment or assuming operational schedules of equipment.
+
+There are many building characteristics and items of equipment that can affect electricity demand. To avoid a naive data dredging analysis we approached building engineers to identify factors they suspected were influencing demand or were of interest to them. Our data included building attributes such as the type of electric equipment installed, building use and building meter characteristics (did the metered demand contain tenant usage?). The characteristics they identified are discussed in more detail in Section \@ref(building-attributes). We then used multimodel inference to test if these were statistically significant predictors and estimate how they influenced electricity demand over the day.
+
+Multimodel inference is an information theoretic approach to model selection that relies on fitting multiple models with different combinations of predictors and then averaging the best performing models based on a suitable weight metric [@Burnham2003-hn]. It is commonly used in ecology [@Symonds2011-fi] but is not often used in the energy sector. To our knowledge the only example is @So2016-of which used multimodel inference to create candidate models for the disaggregation of combined meter data for university campus buildings. It is a standard approach when there is no model specification that clearly outperforms others or when there is some uncertainty around which predictors to include. In our case it was necessary as using an all subset approach failed to produce a clear best model. Furthermore, simply picking the best performing model after an all subset analysis fails to take into account model selection uncertainty and often leads to inflated p-values [@Burnham2003-hn]. Multimodel inference allows us to account for both model selection and parameter estimation uncertainty, thereby giving more reliable estimates of variable importance.
+
+Electricity meter data is correlated within buildings. Some buildings will consistently have high demand, and others low. Mixed effects models allow us to account for this _within-subject_ correlation by treating each building as a random effect. The random effect size indicates how much the mean of each individual's response variable differs from the sample population's mean. By modelling each building as a random effect, each building is treated as a random sample from a population of buildings with a specific distribution. Instead of model residuals being the only random component of our model, the random building selection is also taken into account. Mixed effects models also include fixed effects which are non-random quantities. In our case, fixed effects are the different building characteristics that we wish to create demand impact profiles for.
+
+The main contribution of this paper is a methodology for generating demand impact profiles of various building characteristics at different times of the year. In addition to estimating the conditional mean we show how to calculate confidence intervals for our coefficient estimates that include both model and parameter selection uncertainty. We apply our approach to a real world dataset consisting of `r n_buildings` commercial office buildings. In summary, the key advantages of our proposed methodology are:
+
+* Only smart meter and building characteristic data are required to create demand impact profiles.
+* Confidence intervals that include both parameter estimation and model selection uncertainty are produced.
+* The impact of building characteristics other than plug loads can be quantified.
+
+The paper is structured as follows. Section \@ref(data) discusses the time series data and metadata that motivates our research. Our mixed effects model and the multimodel inference approach are introduced in Section \@ref(methodology). Section \@ref(discussion) presents our estimates for building characteristic demand impact profiles and discusses applications and future research. Concluding remarks are made in Section \@ref(conclusion).
+
+# Data
+
+Data has been provided by Buildings Alive. Metered electricity consumption and building characteristic data is available for `r n_buildings` buildings across Australia. Several years of data are available for each building. In general, data is available from `r strftime(min_dt, "%e %B, %Y")` to `r strftime(max_dt, "%e %B, %Y")` for most buildings, although some buildings have slightly less data. Only working days are included when fitting our model as electricity usage is dramatically different on non-working days (weekends and public-holidays). Electricity consumption tends to be significantly lower on non-working days due to equipment not being in use.
+
+## Time series data
+
+We have 15-minute electricity consumption data available for each building. Time series plots of the raw data is shown for several buildings in Figure \@ref(fig:plot-ts-raw). In our analysis we divide the 15-minute electricity consumption values by each building's net lettable area to obtain _normalised_ electricity consumption. These values are always positive and right-skewed (Figure \@ref(fig:plot-population-response-distribution)) suggesting the use of a log-transform when modelling.
+
+### Hourly grouping
+
+In our analysis we group the 15-minute interval readings into hours. While this reduces the granularity of the profile somewhat, it still allows us to assess the overall behaviour across a day while reducing the amount of variance in our coefficient estimates. It also means that each model can be fit to more data than would be available if 15-minute models were used. Working with 15-minute models or other temporal groupings, such as business and non-business hours, is also possible and can be chosen based on an analyst's needs. For our paper we prefer hourly models as they provided useful demand profile visualisations while also allowing sufficient training data for each model.
+
+### Outlier filtering
+
+Smart meter data from buildings can be very noisy and typically contain outliers as seen in Figures \@ref(fig:plot-boxplot-outliers) and \@ref(fig:plot-ts-raw). To avoid having our results adversely impacted by outliers we removed them from our analysis using a simple approach. For each hour, season and building the bottom (1^st^) quantile and top (99^th^) quantile were trimmed before fitting models. While this may have resulted in some valid values being excluded, it offered a quick way to remove the worst outliers.
+
+(ref:plot-population-response-distribution) Histogram of normalised electricity consumption (Wh/m^2^) for all commercial office buildings. A sample of 5% of meter readings at four different times of the day are shown. The readings are positive and right-skewed. Similar distributions occur for the remaining hours of the day.
+
+```{r plot-population-response-distribution, fig.cap="(ref:plot-population-response-distribution)"}
+all_data %>% 
+  filter(Hour %in% p_hours) %>% 
+  sample_frac(0.05) %>% 
+  mutate(Hour = factor(paste("Hour", Hour), 
+                       levels = paste("Hour", p_hours))) %>% 
+  ggplot(aes(x=Wh)) +
+  geom_histogram(colour = ba_palette[1], fill = ba_palette[1], alpha=0.3) +
+  geom_rug(alpha = 0.3) +
+  facet_wrap(~Hour) +
+  labs(y = "Count",
+       x = expression(Normalised~electricity~(Wh/m^2)))
+```
+
+
+```{r plot-boxplot-outliers, fig.cap="Hourly boxplots of normalised electricity consumption for building BID0212. Outliers are shown by circles. We see that there have been periods of low occupancy during business hours which result in outliers."}
+all_data %>% 
+  filter(BID == "BID0212") %>% 
+  # mutate(Wh = log(Wh)) %>% 
+  ggplot(aes(x = Hour, y = Wh, group = Hour)) +
+  geom_boxplot(outlier.shape = "O") +
+  facet_wrap(~Season) +
+  labs(y = expression(Normalised~electricity~(Wh/m^2))) +
+  ylim(0, NA)
+
+# all_data %>% 
+#   filter(BID == sample(unique(all_data$BID), 4)) %>% 
+#   # mutate(Wh = log(Wh)) %>% 
+#   ggplot(aes(x = Hour, y = Wh, group = Hour)) +
+#   geom_boxplot(outlier.shape = "O") +
+#   facet_grid(BID~Season) +
+#   labs(y = expression(Normalised~electricity~(Wh/m^2))) +
+#   ylim(0, NA)
+```
+
+
+
+## Building attributes
+
+We were motivated in our research by engineers that wished to statistically assess the relevance and importance of different building characteristics on electricity demand. Several characteristics were available but, to avoid overfitting and missing value issues, we limited ourselves to a subset that was of interest to their company and had high data quality. Our main research goal was to understand how each of these selected characteristics affected electricity demand. This is one of the contributions of our methodology - it allows us to assess the statistical significance and effect size of whatever characteristics we are presented with using only smart meter data and attribute data.
+
+Three characteristic types are considered. _Direct_ characteristics consume electricity and include items such as cooling equipment and electric heating equipment. _Behavioural_ characteristics include tenant and management practices. _Indirect_ characteristics are those that affect electricity demand but do not themselves use electricity. Examples can include glazing, insulation and gas heating equipment.
+
+The variables we consider for modelling are described below.
+
+__Tenant feed.__ _(behavioural)_ Some metered data only included electricity demand from the base building and excluded tenant usage. This variable identified if tenant consumption was included in the metered demand. Tenant data may include electricity demand from plug loads (e.g. computers, air conditioning) and lighting.
+
+__Water cooled condenser.__ _(direct)_ A water cooled condenser discharges heat by transferring stored heat energy from a refrigerant to running water. The heated water may then be cooled in a cooling tower.
+
+__DX system.__ _(direct)_ Direct expansion (DX) systems cool air. We were initially presented with two variables, DX system and chiller system, that had strong negative correlation. In other words, buildings would typically be equipped with one or the other. DX systems cool air whereas chiller systems cool water. We chose to work with DX system as one of our variables, though the choice was somewhat arbitrary as the main goal was to avoid multicollinearity. Reverse DX was another available variable, however this was omitted as only five buildings had reverse DX and there was obviously strong correlation with the DX system variable.
+
+__Gas fired boiler.__ _(indirect)_ Gas fired boilers provide heating. They are fuelled by natural gas or propane and do not directly impact electricity demand. If a gas boiler is installed there will be no need to use electric heating to warm the building. Hence, they have an indirect effect as they offset the electricity that would otherwise have been required by an electric system.
+
+__Electric element heating.__ _(direct)_ These heating systems are powered by an electrical source. A current is passed through metallic heating elements causing the elements to heat due to their resistance.
+
+__Centralised distribution.__ _(direct)_ We were initially provided with _centralised distribution_ and _per-floor distribution_ variables. These had strong negative correlation (buildings typically had one or the other) and so we chose to use only centralised distribution in our model. Centralised distribution systems generate all cooling from one location and rely on ductwork for air distribution whereas per-floor distribution has cooling units on each floor.
+
+Examples of the building attributes for six buildings are shown in Table \@ref(tab:attribute-example). It is difficult to observe a relationship between each of these attributes and normalised consumption by simply comparing them to the electricity consumption plots in Figure \@ref(fig:plot-ts-raw). High volatility in each time series, coupled with the large number of buildings and the variation between buildings makes the attribute and demand relationship unclear. This motivates our research into finding an appropriate model to quantify their impact on demand.
+
+
+(ref:plot-ts-raw) Time series plots of commercial office building smart-meter data for six of the `r n_buildings` buildings. Each building has distinct business hour and non-business hour behaviour. The shape and volatility of the readings differ between each building. It is difficult to observe a clear relationship between the attributes listed in Table \@ref(tab:attribute-example) and electricity demand using these visualisations alone. This motivates the development of our proposed approach that allows us to statistically test and quantify the relationship of each attribute and electricity demand.
+
+```{r plot-ts-raw, fig.cap="(ref:plot-ts-raw)"}
+p_bids <- c("BID0123", "BID0717", "BID0720", "BID0045", "BID0061", "BID0210")
+all_data %>% 
+  # filter(BID %in% sample(BID, 3),
+  filter(BID %in% p_bids,
+         Date >= dmy("9/1/2017"),
+         Date < dmy("15/1/2017")) %>% 
+  ggplot(aes(x = ts, y = Wh)) +
+  geom_line() +
+  facet_wrap(~BID, ncol = 2) +
+  labs(y = expression(Normalised~electricity~(Wh/m^2)),
+       x = "Date")
+```
+
+
+```{r attribute-example}
+all_data %>% 
+  filter(BID %in% p_bids) %>% 
+  select(BID, !!attribute_names) %>% 
+  distinct() %>% 
+  gather(Attribute, Value, -BID) %>% 
+  spread(BID, Value) %>% 
+  mutate(Attribute = camel_case_to_normal(Attribute)) %>% 
+  knitr::kable(format = "latex", booktabs = TRUE, caption = paste("Building attributes for six of the", n_buildings, "buildings.")) %>% 
+  kableExtra::add_header_above(c(" ", "Building" = length(p_bids))) %>% 
+  kableExtra::kable_styling()
+```
+
+# Methodology
+
+Figure \@ref(fig:flowchart) shows a flowchart of our proposed methodology. All of the available electricity and attribute datasets for each building are combined into one and then split by hour of day. Multimodel inference, parameter estimation and the estimation of proportional impacts is carried out separately for each hour (and season). The final step involves combining these hourly proportional impact estimates to produce a demand profile showing the estimated change in demand when an attribute is or isn't present. A simulation study that examines the capability of our proposed methodology is provided in Appendix \@ref(simulation-results).
+
+```{r flowchart, fig.cap="Flowchart of the proposed methodology for a given season."}
+knitr::include_graphics("fig/flowchart.pdf")
+```
+
+## Mixed effects model
+
+We use a linear mixed effects model to describe the relationship between building attributes and electricity consumption. Mixed effects models can capture within-subject correlation which allows us to estimate parameters common to an entire population (fixed effects) and subject-specific parameters (random effects) [@Pinheiro1978-tg]. If we consider each building as a subject we have within-subject correlation in the electricity meter readings. Hence, we treat each building as a random effect. Building characteristics can be interpreted as population parameters and so they are modelled as fixed effects.
+
+We create separate models for each season and hour of the day to allow for changes in building behaviour that typically occur over the course of the day and year. For instance, non-business hours will often have significantly less consumption than business hours. Peaks can occur in the morning due to pre-heating or pre-cooling. Heating equipment will be more important in winter and cooling equipment in summer. Distinct models for each hour and season allow for a comparison of their estimated fixed effect coefficients at different times. Plotting these estimates and their confidence intervals provide a clear overview of how each attribute's impact on demand evolves.
+
+For a particular season and hour of the day the electricity consumption over 15-minute intervals, $y_{ij}$, for building $j$ and observation $i \in \left\{ 1, 2, \ldots n_j\right\}$ is given below. The Boolean variables $x_{hij}$ are equal to one if the $h$^th^ building attribute is present and zero otherwise. We use a log-transform on the consumption data as it is positive and right-skewed (see Figure \@ref(fig:plot-population-response-distribution)). The mixed model is
+
+\begin{equation}
+\begin{gathered}
+\log y_{ij} = \beta_0 + \sum_{h=1}^p \beta_h x_{hij} + u_{0j} + u_{1j} t_{ij} + \epsilon_{ij}, \\
+\begin{bmatrix} 
+  u_{0j} \\ 
+  u_{1j}
+\end{bmatrix} \sim N(0, \Omega_u), \quad
+\Omega_u = \begin{bmatrix}
+              \sigma^2_{u0} & \sigma_{u01} \\
+              \sigma_{u01} & \sigma^2_{u1}
+            \end{bmatrix}, \\
+\epsilon_{ij} \sim N(0, \sigma^2_\epsilon),
+\end{gathered} \label{eq:memodel}
+\end{equation}
+
+where $\beta_h$ is the coefficient for attribute indicator $x_{hij}$, $u_{0j}$ is the random intercept for building $j$, $u_{1j}$ is the random slope coefficient for year $t_{ij}$ and $\epsilon_{ij}$ are the residuals. This linear mixed effects model allows the intercept to vary with each building. A random slope for year has been added to capture any trends in building performance. We include a covariance term $\sigma_{u01}$ in the variance-covariance matrix to allow for correlation between the random intercept and random slope. This is chosen as we tend to observe negative correlation between the random intercept and slope.
+
+We also attempted to model residuals using an autoregressive correlation structure of order 1. While this did reduce autocorrelation in the standardised residuals [@Pinheiro1978-tg] it had almost no impact on our final fixed effect coefficient estimates and confidence intervals. Furthermore, the $AR(1)$ correlation structure resulted in a considerable increase in computation time and occasionally convergence issues. Given this, we chose to model residuals as in equation \@ref(eq:memodel).
+
+
+## AIC for mixed effects models
+
+A means to assess each model for goodness of fit and complexity is required when conducting model selection. Complicated models may fit data better, but fail to generalise to new datasets. This is indicative of over-fitting rather than a well specified model. Information criteria such as the Akaike information criteria (AIC; @Akaike1998-hd) and Bayesian information criteria (BIC; @Schwarz1978-hj) score models on how well they fit data while also penalising them for complexity. Choosing a suitable information criteria for a linear mixed effects model is typically more complicated than in linear regression due to issues arising from the selection of covariance structures and positive semidefinite constraints on the covariance matrix [@Muller2013-fl].
+
+For our model selection we use the marginal AIC (mAIC) which is the most widely used information criteria for mixed effects models. @Vaida2005-mt define the mAIC as
+
+\begin{equation}
+mAIC = -2\ell\left(\hat{\mathbf{\beta}}\right) + 2 (p+q),
+\end{equation}
+
+where $\ell\left(\hat{\mathbf{\beta}}\right)$ is our log-likelihood function, $p$ is the number of fixed effects, $q$ is the number of random effects. We choose this criterion as it is both simple to understand and has been used in many studies [@Muller2013-fl].
+
+## Multimodel inference
+
+Despite the effort taken to carefully determine appropriate building characteristics for our model there is still uncertainty regarding the importance of each proposed variable. Multimodel inference allows us to incorporate this model selection uncertainty into our parameter estimates. Instead of simply conducting stepwise variable selection or best subset selection and then choosing the best model, we instead use a candidate set of models on which we base our inference. This model averaging approach has merit as sometimes the best model will only offer a small improvement over other models based on a quality score such as AIC. Had a different dataset sample been present it may have resulted in another model being selected as the best [@Burnham2003-hn]. Furthermore, different models will sometimes show the same variable being significant or insignificant [@Symonds2011-fi]. The overall conclusion is that model selection uncertainty needs to be taken into account when conducting inference in situations such as ours. If we only focus on parameter estimation uncertainty without considering model selection uncertainty we will likely underestimate the size of our confidence intervals.
+
+Multimodel inference focuses on selecting a subset of models on which to base inference. Note that effort should be taken to avoid data dredging (where the computer is left to select the best variables with no prior hypothesis on the researcher's part). @Burnham2003-hn suggest using prior knowledge of the situation to determine suitable predictors. Fitting only a subset of all possible models is a sensible approach because fitting all possible models can quickly result in a large computational burden if the number of predictors is large^[Given $p$ predictors we would require 2^p^ models to be fitted.]. As discussed in Section \@ref(building-attributes) we have narrowed all available predictors down to a reasonable subset based on advice from domain experts.
+
+Given our subset of predictors, multimodel inference fits a separate mixed effects model to every combination of predictor variables. This gives 2^p^ models each with an $mAIC$ score. The best performing models form our candidate set on which we conduct inference.
+
+### Candidate sets
+
+To construct our candidate set we must first determine the probability of each candidate model. To do so we use Akaike weights. Given $R$ candidate models the Akaike weight for model $g_i$ is
+
+\begin{equation}
+w_i = \frac{\mathcal{L} \left(g_i | \mathbf{x} \right)}{\sum_{r=1}^R \mathcal{L} \left(g_r | \mathbf{x} \right)} 
+    = \frac{e^{-\frac{1}{2}\Delta_i}}{\sum_{r=1}^R e^{-\frac{1}{2}\Delta_r}},
+\end{equation}
+
+where $\mathcal{L} \left(g_i | \mathbf{x} \right)$ is the likelihood of model $g_i$ given data $\mathbf{x}$ and $\Delta_i = mAIC_i - mAIC_{min}$ is referred to as the AIC difference. We use $mAIC$ in our analysis as we are dealing with mixed effects models. Other information criteria for mixed effects models such as the conditional AIC [@Greven2010-sv; @Vaida2005-mt] may also be used.
+
+We can use the AIC differences and Akaike weights to select a subset of models for inference. We refer to this subset as the candidate set. For our analysis we use the common practice of selecting models with the highest weights such that their cumulative sum is just above 95%. As the weights serve as model probabilities we can refer to this as a 95% confidence set.
+
+### Parameter estimates
+
+Parameters are estimated by "averaging" the models in our confidence set. There are two common approaches to model averaging. _Natural-model averaging_ averages over all candidate models where a parameter of interest occurs. _Full-model averaging_ considers all candidate models. If a variable is not selected in one of the candidate models, full-model averaging sets its estimate to zero. Hence, full-model averaging takes into account when a variable has not been selected whereas natural-model averaging does not. Furthermore, simulation studies have found that full-model averaging can help to reduce problems caused by model selection bias towards overly complex models [@Lukacs2010-xz]. We use full-model averaging for this reason.
+
+Given a candidate set of $R$ models our full-model averaged coefficients $\beta_h$ are estimated by
+
+\begin{equation}
+\hat{\bar{\beta_h}} = \sum^R_{i=1} w_i \hat{\beta}_{hi},
+\end{equation}
+
+where $\hat{\beta}_{hi}$ is the estimate of $\beta_h$ based on model $g_i$. If $\beta_h$ is not chosen in model $g_i$ then $\hat{\beta}_{hi}$ is defined to equal zero in the above formula.
+
+
+### Unconditional confidence intervals
+
+Once a set of candidate models has been identified we can construct confidence intervals that reflect both parameter and model selection uncertainty. The $\left( 1-\alpha \right)100\%$ unconditional confidence intervals for the a model averaged coefficient $\hat{ \bar{ \beta}}_h$ is given by
+
+\begin{equation}
+\hat{ \bar{ \beta}}_h \pm z_{1- \alpha/2} \widehat{ \text{ase}}\left( \hat{ \bar{\beta}}_h \right),
+\end{equation}
+
+where $\widehat{ \text{ase}}\left( \hat{ \bar{\beta}}_h \right)$ is the adjusted standard error from @Burnham2002-vs. It is given by
+
+\begin{equation}
+\widehat{ \text{ase}}\left( \hat{ \bar{\beta}}_h \right) = \sum^R_{i=1} w_i \sqrt{ \left( \frac{t_{\text{df}_i, 1-\alpha/2}}{z_{1-\alpha/2}} \right)^2  \widehat{\text{var}} \left( \hat{\beta}_{hi} | g_i \right) + \left( \hat{\beta}_{hi} - \hat{\bar{\beta}}_h \right)^2 },
+\end{equation}
+
+where $\bar{\beta}_h$ is the model averaged estimator of $\beta_h$, $\widehat{\text{var}} \left( \hat{\beta}_{hi} | g_i \right)$ is the estimated variance of parameter $\beta_{hi}$ in model $g_i$, and $w_i$ are weights. The calculation of $\widehat{\text{var}} \left( \hat{\beta}_{hi} | g_i \right)$ for mixed effects models is reasonably complex and is omitted (see @Bates2015-zw for a discussion).
+
+
+
+## Estimating power demand profiles
+
+In equation \@ref(eq:memodel) we have modelled the log-transform of electricity consumption over 15-minute intervals as our response. We use the estimator proposed by @Kennedy1981-xu to calculate the proportional impact, $p_h$, of $X_{hij}$ on the dependent variable $Y_{ij}$. Kennedy's estimator is consistent and almost unbiased [@Giles2011-cv]. For a dummy variable changing from zero to one the estimator is given by
+
+\begin{equation}
+\hat{p}_h = e^{ \hat{ \bar{\beta}}_h - 0.5 \widehat{ \text{ase}}\left( \hat{ \bar{\beta}}_h \right)^2} - 1,
+\end{equation}
+
+where we have replaced the coefficient estimate and variance of Kennedy's original estimator with our full-model averaged counterparts. As this is the proportional impact we can rewrite the above expression in terms of our response variable to obtain
+
+\begin{equation}
+Y_{ij}^* = e^{ \hat{ \bar{\beta}}_h - 0.5 \widehat{ \text{ase}}\left( \hat{ \bar{\beta}}_h \right)^2} \mathbb{E} \left[ Y_{ij} | X_{hij} =  0 \right],
+\end{equation}
+
+where $Y_{ij}^*$ is the new consumption value after our Boolean variable has changed from false to true. Calculating $Y_{ij}^*$ using this formula for each hour of the day gives our power demand profiles. Taking the difference between $Y_{ij}^*$ and $\mathbb{E} \left[ Y_{ij} | X_{hij} =  0 \right]$ gives our estimate of the demand impact profiles. Note that we have chosen to base our profiles off $\mathbb{E} \left[ Y_{ij} | X_{hij} =  0 \right]$ rather than an unconditional mean or median because we are working with proportional impacts. Since we show the impact of a variable switching from false to true it seems reasonable to apply the proportional impact to the mean demand that we observe when an attribute isn't present, hence the use of the conditional expectation. Simply using the mean or median may exaggerate the demand impact profiles.
+
+
+## Fitting models
+
+We fit our models using the R statistical programming language [@R-base]. The `lme4` package is used to fit our mixed effects model and calculate mAIC scores [@R-lme4]. Multimodel inference is carried out using the `MuMIn` package [@R-MuMIn].
+
+All code used to produce this analysis has been made available at [https://github.com/camroach87/1801-MMME](https://github.com/camroach87/1801-MMME).
+
+
+# Discussion
+
+In this section we apply our methodology to assess the impact of building characteristics on electricity demand across the day. We also examine how well our models fit the data and comment on the limitations of our statistical methodology. Several future research directions are put forward.
+
+To validate our approach a simulation study was also conducted using simulated time series data designed to mimic electricity demand in commercial buildings. We found that after simulating electricity consumption for 129 buildings our methodology was able to estimate the coefficients acceptably, with most estimates falling within the 90% confidence intervals. Details of the simulation study are provided in Appendix \@ref(simulation-results).
+
+## Goodness of fit
+
+Prior to analysis of our results it is important to assess if our models actually fit the data acceptably. We use marginal and conditional R^2^ values for each season and hourly model to assess the goodness of fit. Adapting the specification of @Nakagawa2013-zc to our case, the conditional R^2^ calculates the proportion of the variance explained by both fixed and random effects and is given by
+
+\begin{equation}
+R^2_c = \frac{\sigma_f^2 + \sigma_u^2 }{\sigma_f^2 + \sigma_u^2 + \sigma_\epsilon^2},
+\end{equation}
+
+where $\sigma_f^2 = \text{var} \left( \sum_{h=1}^p \beta_h x_{hij} \right)$ is the variance of the fixed effects, $\sigma_u^2$ is the variance of random effects and $\sigma_\epsilon^2$ is the residual variance. As we are working with a random slope model the random effect variance is calculated as described in @Johnson2014-st. Marginal R^2^ considers only fixed effects and is defined as
+
+\begin{equation}
+R^2_m = \frac{\sigma_f^2}{\sigma_f^2 + \sigma_u^2 + \sigma_\epsilon^2}.
+\end{equation}
+
+The goodness of fit statistics are shown in Table \@ref(tab:r2-values) and Figure \@ref(fig:plot-r2). Overall, it appears that our model formulation gives reasonable fits with the conditional R^2^ values averaging close to 0.9. Models close to the start and end of business hours show the worst fits due to the noisiness of data during these times. This likely reflects the different operating schedules for different buildings at these times of the day. Another point to note is our marginal R^2^ values are consistently higher during winter business hours compared to other seasons. This indicates that the chosen building attributes are better at modelling heating loads than cooling loads.
+
+Marginal R^2^ only includes the impact of fixed effects allowing us to assess how much of the variance in electricity consumption is explained by them. This lets us examine the goodness of fit when using building attribute variables only. If fixed effects do not explain any variation in the data our marginal R^2^ values will be close to zero. In our case we see marginal R^2^ values range between 0.25 and 0.5 whereas the conditional R^2^ values range between 0.8 and 0.95. To be able to explain 25-50% of the variance in the data with only a handful of attributes is encouraging and shows that at least some of the building characteristics we are working with have explanatory power. For reference, 0.25-0.5 is not an unreasonable range^[More studies using mixed effects models on smart-meter data need to be conducted before it is fair to conclude that the values presented here are low or high.] when compared with ecology studies [@Nakagawa2013-zc]. Given the building attributes alone are able to account for some of the variation in the data suggests that they do improve the model fit. Once inter-building differences are accounted for by including the random effects we see subjectively good fits based on the conditional R^2^. It is recommended that future smart-meter studies using mixed effects models should include both marginal and conditional R^2^ values to allow for a discussion on how well their fixed effects model the data. Being able to examine how much variance the fixed effects capture is important to consider and provides interesting information [@Nakagawa2013-zc]. Should marginal R^2^ values ever be close to zero applying our methodology will not prove particularly useful even if high conditional R^2^ values are observed, and so it is important to include this information.
+
+
+(ref:r2-values) Conditional and marginal R^2^ values for each hour and season's best model after all-subsets selection.
+
+```{r r2-values}
+n_df %>% 
+  select(Season, Hour, R2) %>% 
+  unnest() %>% 
+  rename(Marginal = R2m, Conditional = R2c) %>% 
+  gather(Type, R2, Marginal, Conditional) %>% 
+  unite(Temp, Season, Type) %>% 
+  spread(Temp, R2) %>% 
+  select(Hour, starts_with("Summer"), starts_with("Autumn"), starts_with("Winter"), starts_with("Spring")) %>% 
+  mutate_if(is.double, round, 2) %>% 
+  knitr::kable(format = "latex",
+               booktabs = TRUE,
+               caption = "(ref:r2-values)",
+               # col.names = c("Hour", rep(c("C", "M"), 4))) %>%
+               col.names = c("Hour", rep(c("$R^2_c$", "$R^2_m$"), 4)),
+               escape = FALSE) %>% 
+  kableExtra::add_header_above(c(" ", "Summer" = 2, "Autumn" = 2, "Winter" = 2, "Spring" = 2)) %>% 
+  kableExtra::kable_styling()
+```
+
+
+(ref:plot-r2) Conditional and marginal R^2^ values for each hour and season's best model after all-subsets selection. The marginal R^2^ value represents the variance explained by fixed effects whereas the conditional R^2^ value is the variance explained by both fixed and random effects. When we plot these goodness of fit values we see a drop during the working hours which is expected due to the more volatile nature of demand during these times.
+
+```{r plot-r2, fig.cap="(ref:plot-r2)"}
+n_df %>% 
+  select(Season, Hour, R2) %>% 
+  unnest() %>% 
+  rename(Marginal = R2m, Conditional = R2c) %>% 
+  gather(Type, R2, Marginal, Conditional) %>% 
+  ggplot(aes(x = Hour, y = R2, colour = Type, shape = Type)) +
+  # geom_line() +
+  geom_point() +
+  facet_wrap(~Season) +
+  ylim(0, 1) +
+  labs(colour = NULL,
+       shape = NULL,
+       y = expression(R^2))
+```
+
+
+We also examined quantile-quantile (QQ) plots to check if model residuals were normally distributed. For the most part the residuals did appear to be normally distributed, though there was some evidence of heavy tails. This was largely due to some remaining outliers in the time series data - sometimes caused by erratic spikes and unexpected drops in demand. Extreme weather and unmarked local holidays in the data could each be responsible for some of the noise. Including the relationship between temperature and electricity demand would likely improve our fits. However, due to the added complexity^[The electricity temperature relationship in each building can be quite nonlinear and varies across the day.] and a desire to keep our mixed effects model clear for explanatory purposes we leave this for future research. Considering the noisiness of the data we were satisfied that the residuals were close enough to being normally distributed for our analysis.
+
+
+## Demand impact profiles
+
+Plots of the power demand profiles and demand impact profiles for tenant consumption, electric element heating and DX systems are shown in Figures \@ref(fig:plot-profile-tenant), \@ref(fig:plot-profile-electric-heating) and \@ref(fig:plot-profile-dx-system), respectively. Power demand profiles with and without the attribute in question are shown in the top panels; whereas the bottom panels show the demand impact profiles. These three plots show examples of behaviour impact, caused by occupants; and equipment impact, caused by equipment that directly draws electricity demand. Note that normalised consumption over 15-minutes intervals was used as the response variable in our mixed effects model. To aid in interpretation of results the fixed effect estimates are converted from units of energy to units of power^[This is a simple matter of dimensional analysis where 1 Wh of energy consumed over a duration of 15-minutes is equivalent to 4 W: $\frac{1 \text{ Wh}}{15\text{ min}} = \frac{1 \text{ Wh}}{1/4 \text{ h}} = 4 \text{ W}$.] when plotting.
+
+As we have data for buildings with and without tenant consumption data we can estimate the expected behaviour of tenants (Figure \@ref(fig:plot-profile-tenant)). This is an example of assessing occupant behaviour with our model. As expected we see a large contribution to electricity demand by tenants, ranging from 6 to 15 W/m^2^ across all seasons. Of particular interest is the large morning spike we see at 6:00 am in summer, possibly caused by tenants attempting to pre-cool their offices to ensure occupant comfort over the course of the day. Observing tenant behaviour allows us to quantify and view when demand from tenants is occurring. This provides some guidance on how much potential savings there might be (as an upper bound), or how the shape of the profile might be modified through intervention. One useful application of this is to assess if a demand management initiative is successful. Including  it as a fixed effect will allow for demand impact profiles to be created. Decision makers may then assess statistically if said initiative was successful or not.
+
+Profiles for electric element heating are shown in Figure \@ref(fig:plot-profile-electric-heating). Here we assess a building characteristic that directly uses electricity and where the behaviour is known. As would be expected with heating equipment we see only a small change in demand during summer. Slightly higher demand is seen in autumn and spring, likely due to cold days during the months that border winter. Winter sees a large increase in electricity demand due to heating required during business hours. 
+
+As a final example, the subplots in Figure \@ref(fig:plot-profile-dx-system) highlight that buildings with DX systems tend to use more electricity than those without. Given there was a strong negative correlation with chiller systems (see Section \@ref(building-attributes)) it seems reasonable to conclude that chiller systems offers a more energy efficient alternative based on this dataset. However, this conclusion should be tempered by inspecting the confidence intervals in Figure \@ref(fig:plot-ci-dx-system). The coefficient estimates are, for the most part, only significant ($\alpha = 0.1$) during winter. It is possible that this result captures the impact of reverse DX systems being used for heating during winter months.
+
+Centralised distribution and gas fired boilers did not show statistically significant ($\alpha = 0.1$) effects at any time of the year. Water cooled condensers were, for the most part, not statistically significant. Only one model for water cooled condensers (autumn at 5:00 pm ) had a statistically significant impact, but did not provide any useful or interesting conclusions. For reference, a discussion of the coefficients and confidence intervals of all attributes and seasons is provided in Appendix \@ref(profiles-of-all-attributes).
+
+In summary, for our building stock we can conclude that:
+
+* We do not observe a statistically significant difference between centralised and per-floor distribution systems. Hence, we can not conclude that one is more or less efficient than the other based on this dataset and controlling for the variables we have chosen to model.
+* We observe DX systems use more energy than chiller systems during winter, though this is possibly due to reverse DX systems being used for heating.
+* Electric element heating increases the expected electricity demand by as much as 6 W/m^2^ during the winter. The largest draw occurs in the morning between 7:00 am and 9:00 am.
+* Gas fired boilers did not make a statistically significant impact on electricity demand. There was an expectation that their presence may result in offsetting electricity demand, but this did not show in the final results. This could perhaps indicate issues with data or building operation.
+* Unsurprisingly, tenant feed had a significant impact for all seasons and at all times of the year. Large increases in tenant demand of approximately 8 W/m^2^ are seen between the hours of 6:00 am to 4:00 pm. Tenant demand gently tapers off after 4:00 pm during autumn, winter and spring, but has a sharp drop after 4:00 pm in summer. There is a large spike in tenant electricity demand at 6:00 am in summer which indicates that there may be opportunities within our building stock to spread out demand at this time to reduce peaks.
+* The presence of water cooled condensers in buildings does not appear to have a significant impact on electricity demand.
+
+Note that these findings only apply to our building stock when controlling for the variables we have used in our model. Each conclusion is subject to idiosyncrasies in the data or perhaps be indicative of unusual building behaviour.
+
+Determining the expected consumption of tenants in buildings may allow for targeted energy saving measures. For example, if there are large peaks at certain times of the day, facility managers may make tenants aware of the need to reduce demand during these times. The early morning spike we observe in summer could be deemed one such time. This peak possibly corresponds to early morning cooling to ensure indoor environments are comfortable when tenants arrive. If this was automated to spread cooling across a longer period the peak could be reduced. While this wouldn't necessarily decrease the overall consumption, the lower peak may reduce costs for peak power consumption^[Especially if time of use tariffs are in place and we observe peaks during expensive times of the day.] and be useful in grid management.
+
+Using these results, the company that provided data were able to determine which attributes were important and how heavily they should be weighted when assessing building similarity for electricity demand. This allowed for benchmarking and target setting for facility managers based not only on a single building's historical demand, but also on other buildings with similar characteristics.
+
+```{r plot-profile-tenant, fig.cap="Profile plots of tenant feed impact. This is an example of a behavioural aspect of electricity demand. Here we can directly assess how tenants typically use electricity during each of the seasons. One notable feature of the plots is the large spike at 6:00 a.m. during summer mornings, possibly caused by precooling of offices. We can not know this for sure without collecting further attribute data on tenant cooling equipment, but does serve to motivate further investigation."}
+# plot_profile_impact(plot_impact_df, "TenantFeed")
+plot_profile_impact(plot_impact_df, "TenantFeed")
+```
+
+```{r plot-profile-electric-heating, fig.cap="Profile plots of electric element heating impact. As expected the heating demand mainly plays a role in winter. The demand in autumn and spring is likely caused by cold days during the shoulder months of winter."}
+plot_profile_impact(plot_impact_df, "ElectricElementHeating")
+```
+
+```{r plot-profile-dx-system, fig.cap="Profile plots of DX system impact. Buildings fitted with DX systems use more electricity during winter months, which may be representative of reverse DX systems being used for heating. Confidence intervals for the estimated coefficients show the winter results are statistically significant during business hours."}
+plot_profile_impact(plot_impact_df, "DXSystem")
+```
+
+
+(ref:plot-ci-dx-system) Coefficient profile plots for DX system coefficients. The solid line shows the estimated coefficients, $\beta_h$, for each hourly model described in equation \@ref(eq:memodel). The 80% and 90% confidence intervals are indicated by the shaded ribbons. Coefficient estimates for winter business hours are significant.
+
+```{r plot-ci-dx-system, fig.cap="(ref:plot-ci-dx-system)"}
+plot_df %>% 
+  filter(Variable == "DXSystem") %>% 
+  ggplot(aes(x = Hour)) +
+  geom_hline(yintercept=0, colour = ba_palette[3], linetype = "dashed") +
+  geom_ribbon(aes(ymin = `10 %`, ymax = `90 %`), fill = ba_palette[2], alpha=0.5) +
+  geom_ribbon(aes(ymin = `5 %`, ymax = `95 %`), fill = ba_palette[2], alpha=0.25) +
+  geom_line(aes(y = Estimate), colour = ba_palette[1]) +
+  facet_wrap(~Season) +
+  labs(y = "Coefficient")
+```
+
+
+
+## Modelling limitations
+
+As with any statistical approach there are certain limitations. While we may find that some variables are statistically significant we can not necessarily comment on causality. Confounding variables and idiosyncrasies of a given dataset may be responsible for some results. Furthermore, if a large number of fixed effects are being explored then it is important to have a large number of buildings in the dataset to avoid the curse of dimensionality. Despite these matters, it is still useful to conduct analyses such as this to better understand underlying behaviour and identify possible anomalies that are worthy of further investigation.
+
+One difficulty of drawing conclusions from mixed effects models is that technical data describing installed equipment is conflated with operational practice. For instance, our centralised distribution variable merely indicated if a building had centralised distribution and not the model, size or how it is typically operated. Larger systems tend to be more efficient than smaller ones and centralised systems tend to have lower cooling loads then per-floor systems as they cannot be influenced (easily) by tenants. While it is theoretically possible to work around this by adding new attribute variables, it quickly increases the dimensionality of the model which then requires more buildings when fitting. More building data and detailed attribute descriptions are required to facilitate fine-grain analysis such as this.
+
+When using statistical models any analysis is limited by the quality and breadth of the available data. Survey results or building characteristics are needed for multiple buildings before any models can be fit. It is important to be aware that when statistical findings do not match with expected behaviour further investigation should be carried out.
+
+## Further research
+
+Including more buildings will allow for more confident conclusions to be reached and more characteristics to be investigated. Of particular interest could be applying our approach to the residential sector to quantify the impact of solar generation, batteries or other household items. Given the prevalence of smart meter data available to both government and distributors, only a survey of household goods would be required. One interesting research direction involves assessing the impact of policies on electricity consumption. If separate models are fit for each year, we can observe how the demand impact profiles are changing between each yearly model. If a policy is introduced to reduce demand for a particular building attribute, we should see a decrease in the profiles between the yearly models. This may help us to determine if polices are proving to be effective or not.
+
+Our mixed effects approach may also be adapted to estimate demand profiles for other building portfolios or energy sources. As long as appropriate goodness of fit measures are calculated and the statistical significance of variables are tested, most modelling pitfalls and erroneous conclusions should be avoided. Different settings will require consideration of  which building characteristics to include and possible modifications to the formula we presented. However, the key idea of splitting data into buckets across the day (hours in our case) and fitting mixed effects models to each should still be applicable. Doing so is beyond the scope of this paper and is left as a future research direction.
+
+Including the relationship between demand and weather variables may offer further improvements to our mixed effects modelling. Despite pursuing a simple formulation throughout our analysis and only adding a trend term to capture yearly changes in climate, we do expect including weather variables would further improve model fits. Doing so also removes them as potential confounding variables.
+
+
+# Conclusion
+
+This paper presents an approach to estimating the impact different building characteristics may have on electricity demand of commercial office buildings. Our approach only requires that smart meter data and attribute data is available for several buildings. The impact that each building characteristic has on energy demand can be presented in the form of demand impact profiles which show the expected change in demand should a characteristic be absent or present. Key advantages of this approach are that it does not require equipment sub-metering and that it can be used to estimate the impact of indirect and behavioural factors.
+
+In addition to providing demand impact profiles, our methodology also produces confidence intervals based on a statistical framework. This allows us to assess the statistical significance of each building characteristic. Mixed effects models are used to account for the correlation within each building's meter readings. A multimodel inference approach, which fits multiple models and weights coefficient estimates by the strength of each model fit, allows us to take both parameter estimation and model selection uncertainty into account when calculating confidence intervals. Hence, we can produce estimates of the effect size and the statistical significance of each characteristic's effect on electricity demand.
+
+To justify the validity of our approach we have conducted a simulation study which shows our model estimates latent variables well. Furthermore, we also describe a case study using `r n_buildings` commercial office buildings from across Australia. We were provided with several building attributes that engineers wished to assess statistically. Applying our methodology allowed us to understand how tenant behaviour and equipment behaviour affected electricity demand across the day at different times of the year. Furthermore, it also highlighted that some characteristics did not appear to have a statistically significant impact on energy demand.
+
+It is our hope that this approach will open the door to further research in this area. Combining smart meter data from multiple buildings with additional descriptive data sources will allow us to quantify electricity consumption patterns. This has potential applications in benchmarking and assessing the efficacy of demand management programs. Such research can play a role in helping us understand the potential of energy efficient practices by highlighting which equipment or design choices result in lower demand. This in turn may help managers and policy makers to enact better, data-driven decisions.
+
+
+
+# Acknowledgements {-}
+
+This research project was supported by funding from Buildings Alive (Fund: 1752291; Grant: 512031). I would like to thank Buildings Alive and its CEO Dr. Craig Roussac for making data available and their guidance in understanding commercial building equipment and behaviour. I would also like to thank Professor Rob Hyndman and Dr. Souhaib Ben Taieb for their continued support and advice throughout the research process. Finally, I would like to thank the reviewers for their thorough and constructive feedback.
+
+This research was supported by use of the Nectar Research Cloud, a collaborative Australian research platform supported by the National Collaborative Research Infrastructure Strategy (NCRIS).
+
+
+# (APPENDIX) Appendix {-}
+
+# Profiles of all attributes
+
+Hourly coefficient profiles for each attribute discussed in Section \@ref(building-attributes) are shown in Figure \@ref(fig:plot-profile-all). These are produced using equation \@ref(eq:memodel) and the multimodel inference approach. The coefficients represent the proportional change in demand when an attribute is or isn't present. Unconditional confidence intervals are also shown which allow us to gauge how statistically significant each attribute's impact is. Note that these coefficients and confidence intervals are calculated separately for each hour of the day to take the changing building dynamics into account.
+
+We can draw several conclusions from Figure \@ref(fig:plot-profile-all). For example, some of the attributes only have a statistically significant impact at certain times of the year. For example, electric element heating is not significant during summer, but does have a statistically significant impact during business hours in winter. A similar result is observed for DX systems. Interestingly, centralised distribution does not appear to be statistically significant at any time of the year. This indicates that in the buildings used in our analysis, the normalised demand does not appear to be affected by whether centralised or per-floor distribution is present. Water cooled condenser and gas fired boiler variables do not appear to play any statistically significant role in energy demand during any of the seasons. We can always see significant coefficient estimates for tenant feed, which is unsurprising given the amount of energy tenants are using.
+
+
+(ref:plot-profile-all) Coefficient profile plots for all attribute coefficients. The solid line shows the estimated coefficients, $\beta_h$, for each hourly model described in equation \@ref(eq:memodel). The 80% and 90% confidence intervals are indicated by the shaded ribbons.
+
+```{r plot-profile-all, fig.cap="(ref:plot-profile-all)", fig.height=14}
+plot_df %>% 
+  filter(Variable %in% attribute_names,
+         Variable != "GlassFacadePercent") %>% 
+  ggplot(aes(x = Hour)) +
+  geom_hline(yintercept=0, colour = ba_palette[3], linetype = "dashed") +
+  geom_ribbon(aes(ymin = `10 %`, ymax = `90 %`), fill = ba_palette[2], alpha=0.5) +
+  geom_ribbon(aes(ymin = `5 %`, ymax = `95 %`), fill = ba_palette[2], alpha=0.25) +
+  geom_line(aes(y = Estimate), colour = ba_palette[1]) +
+  labs(y = "Coefficient") +
+  facet_grid(Variable~Season)
+```
+
+
+# Simulation results
+
+To validate our approach we conduct a simulation with known fixed effect coefficient values. If we assume that each of the estimated coefficients shown in Figure \@ref(fig:plot-profile-all) are correct, we can simulate time series for multiple buildings and test if our proposed methodology can correctly estimate these effect sizes.
+
+Using the estimated winter coefficients shown in Figure \@ref(fig:plot-profile-all) we simulate demand for building $j$ at time $t$ using
+
+\begin{equation}
+\log y_{tj} = \sum_a X_{ja} A_{ah} + \epsilon_{tj}, \quad \epsilon_{tj} \sim ARMA(1,1),
+\end{equation}
+
+where
+
+* $A_{ah} \sim \text{N}(a_{ah}, \sigma_a)$ is the assumed known impact of attribute $a$ during hour $h$,
+* $a_{ah}$ is the estimated coefficient,
+* $\sigma_a$ is the standard error of the fixed effect coefficients, and
+* $X_{ja} \sim \text{Bernoulli}(p_a)$ is a random variable indicating if attribute $a$ is present for building $j$.
+
+The probabilities that an attribute was present for a building, $p_a$, were chosen based on the relative frequency of attributes in the `r n_buildings` commercial office buildings. The expected impact of an attribute is $a_{ah}$ and is assumed to be equal to the estimates we produced in our analysis using real data. The variance $\sigma_a$ allows for the impact of attribute $a$ to vary between buildings and is chosen to be close to the estimated standard error for the fixed effects. Most fixed effects had standard error close to `r sd_a` and so for simplicity we chose $\sigma_a =$ `r sd_a` for all attributes. As we are working with time series data we allow for autocorrelation in the model errors by treating them as an $ARMA(1, 1)$ process with $\phi_1 =$ `r ar_1`, $\theta_1 =$ `r ma_1` and $\sigma_\epsilon =$ `r sd_e`. Doing so produced residuals with similar standard deviation to those observed in the real data. As a final check, we plotted the simulated time series as shown in Figure \@ref(fig:plot-ts-sim) to ensure that they looked reasonable. The simulated time series appear to be realistic when compared to the time series in Figure \@ref(fig:plot-ts-raw). 
+
+We simulated `r sim_horizon/n_sim_period` days of 15-minute demand data for `r n_sim_bldng` buildings using the estimated profiles from winter. Applying our mixed effects multimodel inference approach to this data produced the fixed effect estimates and confidence intervals shown in Figure \@ref(fig:plot-profile-sim). We see that our estimates and confidence intervals perform quite well in estimating the actual values.
+
+
+(ref:plot-ts-sim) Time series plots of simulated smart-meter data for six of the `r n_sim_bldng` simulations. As observed with the real data, each building has distinct business hour and non-business hour behaviour and the load profiles differ between each building.
+
+```{r plot-ts-sim, fig.cap="(ref:plot-ts-sim)"}
+sim_df %>% 
+  filter(BID %in% sample(unique(BID), 6),
+         ts %in% 1:(n_sim_period*5)) %>% 
+  ggplot(aes(x = ts, y = Wh)) + 
+  geom_line() +
+  facet_wrap(~BID, ncol = 2) +
+  labs(y = expression(Normalised~electricity~(Wh/m^2)),
+       x = "Time series index")
+```
+
+
+(ref:plot-profile-sim) Coefficient profile plots based on simulated data for all attribute coefficients. The solid line shows the estimated coefficients for each hourly model and the dashed line shows the known fixed effect values that were chosen. 80% and 90% confidence intervals are indicated by the shaded ribbons. We see that our methodology is able to provide good estimates of the fixed effects.
+
+```{r plot-profile-sim, fig.cap="(ref:plot-profile-sim)"}
+plot_sim_df <- n_sim_df %>% 
+  select(Season, Hour, Coefficients) %>% 
+  filter(!map_lgl(Coefficients, is_null)) %>% 
+  unnest()
+
+# Set excluded variables to zero and CI's to NA
+plot_sim_df <- plot_sim_df %>%
+  tidyr::expand(Season, Hour, Variable) %>% 
+  left_join(plot_sim_df) %>% 
+  mutate(Variable = str_replace(Variable, "TRUE", "")) #%>% 
+  #mutate(Estimate = if_else(is.na(Estimate), 0, Estimate))
+
+
+plot_sim_df %>% 
+  filter(Variable %in% attribute_names) %>% 
+  ggplot(aes(x = Hour)) +
+  geom_ribbon(aes(ymin = `10 %`, ymax = `90 %`), fill = ba_palette[2], alpha=0.5) +
+  geom_ribbon(aes(ymin = `5 %`, ymax = `95 %`), fill = ba_palette[2], alpha=0.25) +
+  geom_line(aes(y = Estimate, linetype = "Estimated"), colour = ba_palette[1]) +
+  geom_line(data = sim_params %>% 
+              select(Variable, Hour, Wh = A) %>% 
+              distinct() %>% 
+              filter(Variable %in% attribute_names), 
+            aes(x = Hour, y = Wh, linetype = "Actual")) +
+  facet_wrap(~Variable) +
+  scale_linetype_manual(values = c(2, 1)) +
+  labs(linetype = NULL,
+       y = "Coefficient")
+```
+
+
+# References {-}
